@@ -1,0 +1,645 @@
+import os
+import sys
+import shutil
+import sqlite3
+import base64
+import re
+import subprocess
+from pathlib import Path
+
+
+# ============================================================
+# Antigravity 2.0 -> Antigravity IDE Conversation Migration
+#
+# Windows
+#
+# NO BACKUP IS CREATED.
+#
+# Source:
+#   %USERPROFILE%\.gemini\antigravity
+#
+# Destination:
+#   %USERPROFILE%\.gemini\antigravity-ide
+#
+# ============================================================
+
+
+HOME = Path.home()
+APPDATA = Path(os.environ["APPDATA"])
+
+OLD_GEMINI = HOME / ".gemini" / "antigravity"
+NEW_GEMINI = HOME / ".gemini" / "antigravity-ide"
+
+OLD_CONVERSATIONS = OLD_GEMINI / "conversations"
+NEW_CONVERSATIONS = NEW_GEMINI / "conversations"
+
+OLD_DB = (
+    APPDATA
+    / "Antigravity"
+    / "User"
+    / "globalStorage"
+    / "state.vscdb"
+)
+
+NEW_DB = (
+    APPDATA
+    / "Antigravity IDE"
+    / "User"
+    / "globalStorage"
+    / "state.vscdb"
+)
+
+
+def info(message):
+    print(f"[INFO] {message}")
+
+
+def success(message):
+    print(f"[OK]   {message}")
+
+
+def warning(message):
+    print(f"[WARN] {message}")
+
+
+def error(message):
+    print(f"[ERROR] {message}")
+
+
+# ============================================================
+# STOP ANTIGRAVITY PROCESSES
+# ============================================================
+
+def stop_antigravity_processes():
+
+    info("Closing Antigravity processes...")
+
+    try:
+
+        subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                (
+                    "Get-Process | "
+                    "Where-Object {$_.ProcessName -like '*antigravity*'} | "
+                    "Stop-Process -Force "
+                    "-ErrorAction SilentlyContinue"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        success("Antigravity processes stopped/checked.")
+
+    except Exception as exc:
+
+        warning(
+            f"Could not automatically stop processes: {exc}"
+        )
+
+
+# ============================================================
+# CHECK PATHS
+# ============================================================
+
+def check_paths():
+
+    required = [
+        (
+            OLD_GEMINI,
+            "Antigravity 2.0 data directory",
+        ),
+        (
+            NEW_GEMINI,
+            "Antigravity IDE data directory",
+        ),
+        (
+            OLD_DB,
+            "Antigravity 2.0 database",
+        ),
+        (
+            NEW_DB,
+            "Antigravity IDE database",
+        ),
+    ]
+
+    for path, description in required:
+
+        if not path.exists():
+
+            error(
+                f"{description} not found:"
+            )
+
+            print(
+                f"       {path}"
+            )
+
+            return False
+
+    return True
+
+
+# ============================================================
+# COPY CONVERSATIONS
+# ============================================================
+
+def copy_conversations():
+
+    if not OLD_CONVERSATIONS.exists():
+
+        raise RuntimeError(
+            "Old Antigravity conversation directory "
+            "does not exist:\n"
+            f"{OLD_CONVERSATIONS}"
+        )
+
+    NEW_CONVERSATIONS.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    source_files = list(
+        OLD_CONVERSATIONS.glob("*.pb")
+    )
+
+    if not source_files:
+
+        raise RuntimeError(
+            "No .pb conversation files were found."
+        )
+
+    info(
+        f"Found {len(source_files)} conversation files."
+    )
+
+    copied = 0
+
+    for source in source_files:
+
+        destination = (
+            NEW_CONVERSATIONS
+            / source.name
+        )
+
+        shutil.copy2(
+            source,
+            destination,
+        )
+
+        copied += 1
+
+    success(
+        f"Copied {copied} conversation files."
+    )
+
+    return copied
+
+
+# ============================================================
+# PATH REPLACEMENT
+# ============================================================
+
+def replace_paths(value):
+
+    if not isinstance(value, str):
+
+        return value
+
+    # .gemini path
+    value = re.sub(
+        r'(?i)(\.gemini[\\/])antigravity(?!-ide)',
+        r'\1antigravity-ide',
+        value,
+    )
+
+    # AppData path
+    value = re.sub(
+        r'(?i)(AppData[\\/]+Roaming[\\/])Antigravity(?![ ]IDE)',
+        r'\1Antigravity IDE',
+        value,
+    )
+
+    return value
+
+
+# ============================================================
+# PROTOBUF HELPERS
+# ============================================================
+
+def parse_summaries(data):
+
+    summaries = []
+
+    i = 0
+
+    while i < len(data):
+
+        if data[i] != 0x0A:
+
+            i += 1
+
+            continue
+
+        i += 1
+
+        length = 0
+        shift = 0
+
+        while i < len(data):
+
+            b = data[i]
+
+            i += 1
+
+            length |= (
+                (b & 0x7F)
+                << shift
+            )
+
+            if not (b & 0x80):
+
+                break
+
+            shift += 7
+
+        if i + length <= len(data):
+
+            summaries.append(
+                data[i:i + length]
+            )
+
+        i += length
+
+    return summaries
+
+
+def encode_varint(value):
+
+    output = []
+
+    while value >= 0x80:
+
+        output.append(
+            (value & 0x7F) | 0x80
+        )
+
+        value >>= 7
+
+    output.append(value)
+
+    return bytes(output)
+
+
+def get_trajectory_id(message):
+
+    if (
+        len(message) >= 38
+        and message[0] == 0x0A
+    ):
+
+        length = message[1]
+
+        if length == 0x24:
+
+            return message[
+                2:38
+            ].decode(
+                "utf-8",
+                errors="ignore",
+            )
+
+    return None
+
+
+def merge_trajectory_summaries(
+    old_value,
+    new_value,
+):
+
+    old_data = (
+        base64.b64decode(old_value)
+        if old_value
+        else b""
+    )
+
+    new_data = (
+        base64.b64decode(new_value)
+        if new_value
+        else b""
+    )
+
+    merged = {}
+
+    # Old Antigravity summaries
+    for item in parse_summaries(old_data):
+
+        trajectory_id = (
+            get_trajectory_id(item)
+        )
+
+        if trajectory_id:
+
+            merged[trajectory_id] = item
+
+    # Existing IDE summaries
+    for item in parse_summaries(new_data):
+
+        trajectory_id = (
+            get_trajectory_id(item)
+        )
+
+        if trajectory_id:
+
+            if trajectory_id not in merged:
+
+                merged[trajectory_id] = item
+
+    output = bytearray()
+
+    for item in merged.values():
+
+        output.append(0x0A)
+
+        output.extend(
+            encode_varint(
+                len(item)
+            )
+        )
+
+        output.extend(item)
+
+    return base64.b64encode(
+        output
+    ).decode("ascii")
+
+
+# ============================================================
+# DATABASE MIGRATION
+# ============================================================
+
+def migrate_database():
+
+    info("Opening databases...")
+
+    old_conn = sqlite3.connect(
+        str(OLD_DB)
+    )
+
+    new_conn = sqlite3.connect(
+        str(NEW_DB)
+    )
+
+    try:
+
+        old_items = dict(
+            old_conn.execute(
+                """
+                SELECT key, value
+                FROM ItemTable
+                WHERE key LIKE 'antigravity%'
+                   OR key LIKE 'google.antigravity%'
+                   OR key = 'history.recentlyOpenedPathsList'
+                """
+            ).fetchall()
+        )
+
+        new_items = dict(
+            new_conn.execute(
+                "SELECT key, value FROM ItemTable"
+            ).fetchall()
+        )
+
+        info(
+            f"Old Antigravity keys: "
+            f"{len(old_items)}"
+        )
+
+        info(
+            f"New IDE keys: "
+            f"{len(new_items)}"
+        )
+
+        processed = 0
+
+        for key, old_value in old_items.items():
+
+            # Do not copy notifications
+            if "notification" in key:
+
+                continue
+
+            # Merge trajectory summaries
+            if (
+                key
+                == "antigravityUnifiedStateSync.trajectorySummaries"
+            ):
+
+                info(
+                    "Merging trajectory summaries..."
+                )
+
+                new_value = (
+                    new_items.get(key)
+                )
+
+                merged = (
+                    merge_trajectory_summaries(
+                        old_value,
+                        new_value,
+                    )
+                )
+
+                new_conn.execute(
+                    """
+                    INSERT OR REPLACE INTO ItemTable
+                    (key, value)
+                    VALUES (?, ?)
+                    """,
+                    (
+                        key,
+                        merged,
+                    ),
+                )
+
+                processed += 1
+
+                continue
+
+            # Do not replace ChatSessionStore index
+            if (
+                key
+                == "chat.ChatSessionStore.index"
+            ):
+
+                continue
+
+            # Copy missing values and preferences
+            if (
+                key not in new_items
+                or "Preferences" in key
+            ):
+
+                value = replace_paths(
+                    old_value
+                )
+
+                new_conn.execute(
+                    """
+                    INSERT OR REPLACE INTO ItemTable
+                    (key, value)
+                    VALUES (?, ?)
+                    """,
+                    (
+                        key,
+                        value,
+                    ),
+                )
+
+                processed += 1
+
+        new_conn.commit()
+
+        success(
+            f"Database migration completed."
+        )
+
+        info(
+            f"Processed {processed} database entries."
+        )
+
+    finally:
+
+        old_conn.close()
+        new_conn.close()
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print()
+    print("=" * 65)
+    print(" Antigravity 2.0 -> Antigravity IDE")
+    print(" Conversation Migration")
+    print("=" * 65)
+    print()
+
+    print(
+        "NO BACKUP WILL BE CREATED."
+    )
+
+    print()
+
+    if not check_paths():
+
+        sys.exit(1)
+
+    print()
+
+    print(
+        "Source:"
+    )
+
+    print(
+        f"  {OLD_GEMINI}"
+    )
+
+    print()
+
+    print(
+        "Destination:"
+    )
+
+    print(
+        f"  {NEW_GEMINI}"
+    )
+
+    print()
+
+    answer = input(
+        "Continue? Type YES to continue: "
+    )
+
+    if (
+        answer.strip().upper()
+        != "YES"
+    ):
+
+        print(
+            "Migration cancelled."
+        )
+
+        return
+
+    print()
+
+    stop_antigravity_processes()
+
+    print()
+
+    copied = copy_conversations()
+
+    print()
+
+    migrate_database()
+
+    print()
+
+    print("=" * 65)
+    print(" MIGRATION COMPLETED")
+    print("=" * 65)
+    print()
+
+    print(
+        f"Conversation files copied: {copied}"
+    )
+
+    print()
+
+    print(
+        "You can now open Antigravity IDE."
+    )
+
+    print()
+
+    print(
+        "IMPORTANT: No backup was created."
+    )
+
+    print(
+        "The existing IDE conversation files were overwritten "
+        "with the files from Antigravity 2.0."
+    )
+
+    print()
+
+
+if __name__ == "__main__":
+
+    try:
+
+        main()
+
+    except KeyboardInterrupt:
+
+        print()
+        print(
+            "Migration cancelled."
+        )
+
+        sys.exit(1)
+
+    except Exception as exc:
+
+        print()
+        error(
+            f"Migration failed: {exc}"
+        )
+
+        sys.exit(1)
